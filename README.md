@@ -1,5 +1,5 @@
 # evnet
-a go net.Conn net.Listener implement, base on evio 
+a go net.Conn net.Listener implement, base on [**evio**](https://github.com/tidwall/evio), and thanks [**@tidwall**](https://github.com/tidwall)
 
 # Demo
 
