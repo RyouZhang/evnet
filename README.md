@@ -50,3 +50,5 @@ func main() {
 	fmt.Println("finish")
 }
 ```
+
+And you can use it with Gin... so enjoy it.
