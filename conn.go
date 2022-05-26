@@ -83,17 +83,22 @@ func (ec *conn) Read(b []byte) (n int, err error) {
 	timeout := ec.rDeadline.Sub(time.Now())
 	if timeout < 0 {
 		select {
-		case raw := <-ec.recvQueue:
-			{
-				ec.buf.Write(raw)
-				n, err = ec.buf.Read(b)
-				if ec.buf.Len() == 0 {
-					ec.buf.Reset()
-				}
-			}
 		case <-ec.shutdown:
 			{
-
+				return
+			}
+		case raw, ok := <-ec.recvQueue:
+			{
+				if ok {
+					ec.buf.Write(raw)
+					n, err = ec.buf.Read(b)
+					if err != nil {
+						return
+					}
+					if ec.buf.Len() == 0 {
+						ec.buf.Reset()
+					}
+				}
 			}
 		}
 		return
@@ -104,14 +109,20 @@ func (ec *conn) Read(b []byte) (n int, err error) {
 	case <-ec.shutdown:
 		{
 			timer.Stop()
+			return
 		}
-	case raw := <-ec.recvQueue:
+	case raw, ok := <-ec.recvQueue:
 		{
 			timer.Stop()
-			ec.buf.Write(raw)
-			n, err = ec.buf.Read(b)
-			if ec.buf.Len() == 0 {
-				ec.buf.Reset()
+			if ok {
+				ec.buf.Write(raw)
+				n, err = ec.buf.Read(b)
+				if err != nil {
+					return
+				}
+				if ec.buf.Len() == 0 {
+					ec.buf.Reset()
+				}
 			}
 		}
 	case <-timer.C:
@@ -127,10 +138,10 @@ func (ec *conn) Write(b []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-
 	select {
 	case <-ec.shutdown:
 		{
+			return
 		}
 	case ec.sendQueue <- b:
 		{

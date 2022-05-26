@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/tidwall/evio"
+	"github.com/panjf2000/gnet/v2"
 )
 
 type Options struct {
@@ -99,14 +99,11 @@ func (s *Transport) onData(c evio.Conn, in []byte) (out []byte, act evio.Action)
 	} else {
 		// send
 		select {
-		case out = <-ec.sendQueue:
-			{
-			}
 		case <-ec.shutdown:
 			{
 				act = evio.Close
 			}
-		default:
+		case out = <-ec.sendQueue:
 			{
 			}
 		}
