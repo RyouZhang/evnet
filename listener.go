@@ -4,25 +4,21 @@ import (
 	"io"
 	"net"
 	"sync"
-
-	"github.com/tidwall/evio"
 )
 
 type listener struct {
-	cOnce sync.Once
-
-	connQueue chan *conn
+	addr      net.Addr
 	shutdown  chan bool
-
-	info evio.Server
+	cOnce     sync.Once
+	connQueue chan *conn
 }
 
-func newListener(info evio.Server) *listener {
+func newListener(addr net.Addr) (*listener, error) {
 	return &listener{
-		shutdown:  make(chan bool),
+		addr:      addr,
+		shutdown:  make(chan bool, 1),
 		connQueue: make(chan *conn, 1024),
-		info:      info,
-	}
+	}, nil
 }
 
 func (l *listener) Accept() (net.Conn, error) {
@@ -34,15 +30,10 @@ func (l *listener) Accept() (net.Conn, error) {
 }
 
 func (l *listener) Close() error {
-	l.cOnce.Do(func() {
-		close(l.shutdown)
-	})
+	close(l.shutdown)
 	return nil
 }
 
 func (l *listener) Addr() net.Addr {
-	if len(l.info.Addrs) > 0 {
-		return l.info.Addrs[0]
-	}
-	return nil
+	return l.addr
 }

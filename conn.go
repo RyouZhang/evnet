@@ -2,177 +2,114 @@ package evnet
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
+	// "fmt"
+	// "io"
 	"net"
-	"sync"
+	"syscall"
 	"time"
-
-	"github.com/tidwall/evio"
 )
 
-var bufPool = sync.Pool{}
-
 type conn struct {
-	c     evio.Conn
-	cOnce sync.Once
+	epfd       int
+	fd         int
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	addr       syscall.Sockaddr
 
-	isError bool
+	input  chan []byte
+	output chan []byte
 
-	errChan   chan error
-	shutdown  chan bool
-	recvQueue chan []byte
-	sendQueue chan []byte
+	inBuf  *bytes.Buffer
+	outBuf *bytes.Buffer
 
-	buf *bytes.Buffer
-
-	rDeadline time.Time
-	wDeadline time.Time
+	errChan chan error
 }
 
-func newEvConn(c evio.Conn, bufferSize int) *conn {
-	buf, _ := bufPool.Get().(*bytes.Buffer)
-	if buf == nil {
-		buf = bytes.NewBuffer(make([]byte, 0, bufferSize))
-	} else {
-		buf.Reset()
-	}
-
-	evc := &conn{
-		c:         c,
-		errChan:   make(chan error, 1),
-		shutdown:  make(chan bool),
-		recvQueue: make(chan []byte, 32),
-		sendQueue: make(chan []byte, 32),
-		buf:       buf,
-	}
-	c.SetContext(evc)
-
-	return evc
-}
-
-func (ec *conn) getError() error {
-	select {
-	case err := <-ec.errChan:
-		{
-			ec.isError = true
-			if err == nil {
-				return errors.New("broken pipe")
-			}
-			return err
-		}
-	default:
-		return nil
+func newConn(fd int, epfd int, localAddr net.Addr, remoteAddr net.Addr) *conn {
+	return &conn{
+		fd:         fd,
+		epfd:       epfd,
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
+		errChan:    make(chan error, 1),
+		input:      make(chan []byte, 64),
+		output:     make(chan []byte, 64),
+		inBuf:      bytes.NewBuffer(make([]byte, 0, 4096)),
+		outBuf:     bytes.NewBuffer(make([]byte, 0, 4096)),
 	}
 }
-
 func (ec *conn) Read(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
+	// n, err = ec.inBuf.Read(b)
+	// if n == 0 {
+	// 	return 0, nil
+	// }
+	// fmt.Println(n, err)
+	// return
 
-	if ec.buf.Len() > 0 {
-		n, err = ec.buf.Read(b)
-		if ec.buf.Len() == 0 {
-			ec.buf.Reset()
+	if ec.inBuf.Len() > 0 {
+		n, err = ec.inBuf.Read(b)
+		if ec.inBuf.Len() == 0 {
+			ec.inBuf.Reset()
 		}
 		return
 	}
 
-	timeout := ec.rDeadline.Sub(time.Now())
-	if timeout < 0 {
-		select {
-		case raw := <-ec.recvQueue:
-			{
-				ec.buf.Write(raw)
-				n, err = ec.buf.Read(b)
-				if ec.buf.Len() == 0 {
-					ec.buf.Reset()
-				}
-			}
-		case <-ec.shutdown:
-			{
-
-			}
-		}
-		return
-	}
-
-	timer := time.NewTimer(timeout)
 	select {
-	case <-ec.shutdown:
+	case raw := <-ec.input:
 		{
-			timer.Stop()
-		}
-	case raw := <-ec.recvQueue:
-		{
-			timer.Stop()
-			ec.buf.Write(raw)
-			n, err = ec.buf.Read(b)
-			if ec.buf.Len() == 0 {
-				ec.buf.Reset()
+			ec.inBuf.Write(raw)
+			n, err = ec.inBuf.Read(b)
+
+			if ec.inBuf.Len() == 0 {
+				ec.inBuf.Reset()
 			}
-		}
-	case <-timer.C:
-		{
-			err = &net.OpError{Op: "read", Addr: ec.LocalAddr(), Source: ec.RemoteAddr(), Err: fmt.Errorf("timeout")}
 		}
 	}
 	return
 }
 
 func (ec *conn) Write(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
+	ec.output <- b
+	n = len(b)
 
-	select {
-	case <-ec.shutdown:
-		{
-		}
-	case ec.sendQueue <- b:
-		{
-			n = len(b)
-			ec.c.Wake()
-		}
-	}
+	// if ec.outBuf.Len() == 0 {
+	// 	ec.outBuf.Reset()
+	// }
+
+	// n, err = ec.outBuf.Write(b)
+	syscall.EpollCtl(ec.epfd, syscall.EPOLL_CTL_MOD, ec.fd, &syscall.EpollEvent{
+		Events: uint32(syscall.EPOLLOUT | ET_MODE),
+		Fd:     int32(ec.fd),
+	})
 	return
 }
 
 func (ec *conn) Close() error {
-	ec.cOnce.Do(func() {
-		close(ec.shutdown)
-		if !ec.isError {
-			ec.c.Wake()
-		}
-		close(ec.sendQueue)
-		bufPool.Put(ec.buf)
+	// fmt.Println("conn Close")
+	syscall.EpollCtl(ec.epfd, syscall.EPOLL_CTL_DEL, int(ec.fd), &syscall.EpollEvent{
+		Events: 0,
+		Fd:     int32(ec.fd),
 	})
+	syscall.Close(ec.fd)
 	return nil
 }
 
 func (ec *conn) LocalAddr() net.Addr {
-	return ec.c.LocalAddr()
+	return ec.localAddr
 }
 
 func (ec *conn) RemoteAddr() net.Addr {
-	return ec.c.RemoteAddr()
+	return ec.remoteAddr
 }
 
 func (ec *conn) SetDeadline(t time.Time) error {
-	ec.rDeadline = t
-	ec.wDeadline = t
 	return nil
 }
 
 func (ec *conn) SetReadDeadline(t time.Time) error {
-	ec.rDeadline = t
 	return nil
 }
 
 func (ec *conn) SetWriteDeadline(t time.Time) error {
-	ec.wDeadline = t
 	return nil
 }
