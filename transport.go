@@ -1,12 +1,12 @@
 package evnet
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"syscall"
-	// "bytes"
 )
 
 type msg struct {
@@ -141,7 +141,8 @@ func (t *Transport) runloop() {
 			{
 				count, err := syscall.EpollWait(t.epfd, t.events, 1000)
 				if err != nil {
-					fmt.Println("Wait", err)
+					fmt.Println("Wait1", err)
+					continue
 				}
 				for i := 0; i < count; i++ {
 					event := t.events[i]
@@ -173,7 +174,7 @@ func (t *Transport) runloop() {
 						})
 
 						syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_ADD, c.fd, &syscall.EpollEvent{
-							Events: uint32(syscall.EPOLLIN | ET_MODE),
+							Events: uint32(syscall.EPOLLIN | ET_MODE | syscall.EPOLLERR | syscall.EPOLLRDHUP),
 							Fd:     int32(c.fd),
 						})
 
@@ -190,45 +191,43 @@ func (t *Transport) runloop() {
 							Fd:     int32(event.Fd),
 						})
 						fmt.Println("invalid fd")
+						syscall.Close(c.fd)
 						continue
 					}
 
 					if event.Events&(syscall.EPOLLERR) != 0 {
-						fmt.Println("EPOLLERR", event.Fd)
+						// fmt.Println("EPOLLERR", event.Fd)
 						syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_DEL, int(c.fd), &syscall.EpollEvent{
 							Events: 0,
 							Fd:     int32(c.fd),
 						})
-						// fmt.Println("remove 1 fd", c.fd)
-						// close conn
+
+						syscall.Close(c.fd)
 						delete(connDic, c.fd)
 						c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
 						continue
 					}
 
 					if event.Events&(syscall.EPOLLRDHUP) != 0 {
-						fmt.Println("EPOLLRDHUP", event.Fd)
+						// fmt.Println("EPOLLRDHUP", event.Fd)
 						syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_DEL, int(c.fd), &syscall.EpollEvent{
 							Events: 0,
 							Fd:     int32(c.fd),
 						})
-						// fmt.Println("remove 2 fd", c.fd)
-						// close conn
+						syscall.Close(c.fd)
 						delete(connDic, c.fd)
 						c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
 						continue
 					}
 
 					if event.Events&syscall.EPOLLIN != 0 {
-
-						total := 0
-						buf := make([]byte, 4096)
-						bufPtr := buf
+						// fmt.Println("EPOLLIN", event.Fd)
+						buf := bytes.NewBuffer(make([]byte, 0, 4096))
+						temp := make([]byte, 4096)
 						for {
-							n, err := syscall.Read(c.fd, bufPtr)
+							n, err := syscall.Read(c.fd, temp)
 							if n > 0 {
-								total = total + n
-								bufPtr = bufPtr[n:]
+								buf.Write(temp[:n])
 								continue
 							}
 							if n == 0 {
@@ -240,10 +239,12 @@ func (t *Transport) runloop() {
 									goto Next
 								default:
 									{
+										fmt.Println("EPOLLIN", c.fd, err)
 										syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_DEL, int(c.fd), &syscall.EpollEvent{
 											Events: 0,
 											Fd:     int32(c.fd),
 										})
+										syscall.Close(c.fd)
 										delete(connDic, c.fd)
 										c.errChan <- err
 										goto End
@@ -252,108 +253,46 @@ func (t *Transport) runloop() {
 							}
 						}
 					Next:
-						if total > 0 {
-							if total == len(buf) {
-								c.input <- buf
-							} else {
-								c.input <- buf[:total]
-							}
-						}
-
-						if c.outBuf.Len() > 0 {
-							syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-								Events: uint32(syscall.EPOLLOUT | ET_MODE),
-								Fd:     int32(c.fd),
-							})
-						} else {
-							syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-								Events: uint32(syscall.EPOLLIN | ET_MODE),
-								Fd:     int32(c.fd),
-							})
+						if buf.Len() > 0 {
+							c.input <- buf.Bytes()
 						}
 					End:
 						continue
 					}
 
-					if event.Events&syscall.EPOLLOUT != 0 {
-						// fmt.Println("EPOLLOUT", event.Fd)
-						select {
-						case raw := <-c.output:
-							{
-								c.outBuf.Write(raw)
-							}
-						default:
-							{
-							}
-						}
+					// if event.Events&syscall.EPOLLOUT != 0 {
+					// 	c.outMux.Lock()
 
-						if c.outBuf.Len() > 0 {
-							buf := make([]byte, 4096)
+					// 	// fmt.Println("EPOLLOUT", event.Fd)
+					// 	if c.outBuf.Len() > 0 {
+					// 		buf := make([]byte, 4096)
 
-							n, _ := c.outBuf.Read(buf)
-							_, err := syscall.Write(c.fd, buf[:n])
-							if err != nil {
-								fmt.Println("EPOLLOUT", c.fd, err)
-								syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_DEL, int(c.fd), &syscall.EpollEvent{
-									Events: 0,
-									Fd:     int32(c.fd),
-								})
-								delete(connDic, c.fd)
-								c.errChan <- err
-								goto B
-							}
-						}
+					// 		n, _ := c.outBuf.Read(buf)
+					// 		_, err := syscall.Write(c.fd, buf[:n])
+					// 		if err != nil {
+					// 			fmt.Println("EPOLLOUT", c.fd, err)
+					// 			syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_DEL, int(c.fd), &syscall.EpollEvent{
+					// 				Events: 0,
+					// 				Fd:     int32(c.fd),
+					// 			})
+					// 			syscall.Close(c.fd)
+					// 			delete(connDic, c.fd)
+					// 			c.errChan <- err
+					// 			c.outMux.Unlock()
+					// 			continue
+					// 		}
+					// 	}
 
-						if c.outBuf.Len() == 0 {
-							c.outBuf.Reset()
-						}
-
-						if c.outBuf.Len() > 0 {
-							syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-								Events: uint32(syscall.EPOLLOUT | ET_MODE),
-								Fd:     int32(c.fd),
-							})
-						} else {
-							syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-								Events: uint32(syscall.EPOLLIN | ET_MODE),
-								Fd:     int32(c.fd),
-							})
-						}
-					B:
-						continue
-
-						// temp := make([]byte, 4096)
-
-						// m, err := c.outBuf.Read(temp)
-						// if err != nil {
-						// 	fmt.Println("EPOLLOUT", c.fd, m, err)
-						// 	continue
-						// }
-						// m, err = syscall.Write(c.fd, temp[:m])
-						// if err != nil {
-						// 	fmt.Println("EPOLLOUT", c.fd, err)
-
-						// 	fmt.Println("add 3")
-						// 	syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-						// 		Events: uint32(syscall.EPOLLIN | ET_MODE),
-						// 		Fd:     int32(c.fd),
-						// 	})
-						// 	continue
-						// }
-
-						// if c.outBuf.Len() > 0 {
-						// 	// fmt.Println("add 1")
-						// 	syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-						// 		Events: uint32(syscall.EPOLLOUT | ET_MODE),
-						// 		Fd:     int32(c.fd),
-						// 	})
-						// } else {
-						// 	syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
-						// 		Events: uint32(syscall.EPOLLIN | ET_MODE),
-						// 		Fd:     int32(c.fd),
-						// 	})
-						// }
-					}
+					// 	if c.outBuf.Len() == 0 {
+					// 		c.outBuf.Reset()
+					// 		syscall.EpollCtl(t.epfd, syscall.EPOLL_CTL_MOD, c.fd, &syscall.EpollEvent{
+					// 			Events: uint32(syscall.EPOLLIN | ET_MODE | syscall.EPOLLERR | syscall.EPOLLRDHUP),
+					// 			Fd:     int32(c.fd),
+					// 		})
+					// 	}
+					// 	c.outMux.Unlock()
+					// 	continue
+					// }
 				}
 			}
 		}
