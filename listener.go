@@ -13,11 +13,11 @@ type listener struct {
 	connQueue chan *conn
 }
 
-func newListener(addr net.Addr) (*listener, error) {
+func newListener(addr net.Addr, connQueue chan *conn) (*listener, error) {
 	return &listener{
 		addr:      addr,
 		shutdown:  make(chan bool, 1),
-		connQueue: make(chan *conn, 1024),
+		connQueue: connQueue,
 	}, nil
 }
 
