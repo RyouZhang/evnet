@@ -14,13 +14,12 @@ type runloop struct {
 	events []sys.EpollEvent
 
 	wg         sync.WaitGroup
-	connQueue  chan *conn
 	openQueue  chan *conn
 	closeQueue chan *conn
 	shutdown   chan bool
 }
 
-func newRunloop() (*runloop, error) {
+func newRunloop(openQueue chan *conn, closeQueue chan *conn) (*runloop, error) {
 	epfd, err := sys.EpollCreate1(sys.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
@@ -28,9 +27,9 @@ func newRunloop() (*runloop, error) {
 	return &runloop{
 		epfd:       epfd,
 		events:     make([]sys.EpollEvent, 8),
-		openQueue:  make(chan *conn, 128),
-		closeQueue: make(chan *conn, 128),
 		shutdown:   make(chan bool, 1),
+		openQueue:  openQueue,
+		closeQueue: closeQueue,
 	}, nil
 }
 
@@ -62,6 +61,7 @@ func (r *runloop) mainloop() {
 					sys.Close(c.fd)
 
 					r.wg.Done()
+					fmt.Println(connDic)
 				}
 			}
 		case c := <-r.openQueue:
@@ -72,10 +72,9 @@ func (r *runloop) mainloop() {
 				c.closeQueue = r.closeQueue
 
 				sys.EpollCtl(r.epfd, sys.EPOLL_CTL_ADD, c.fd, &sys.EpollEvent{
-					Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP),
+					Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
 					Fd:     int32(c.fd),
 				})
-				r.connQueue <- c
 			}
 		default:
 			{
@@ -99,11 +98,26 @@ func (r *runloop) mainloop() {
 					}
 					// fmt.Println(c.fd, event.Events&sys.EPOLLIN, event.Events&sys.EPOLLRDHUP, event.Events & sys.EPOLLOUT)
 
-					if  event.Events&sys.EPOLLRDHUP != 0 {
+					if event.Events&sys.EPOLLHUP != 0 {
+						fmt.Println("EPOLLHUP", event.Fd)
+						delete(connDic, c.fd)
+
+						sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+							Events: 0,
+							Fd:     int32(c.fd),
+						})
+						sys.Close(c.fd)
+
+						r.wg.Done()
+						c.errChan <- fmt.Errorf("broke fd: %d", c.fd)
+						continue
+					}
+
+					if event.Events&sys.EPOLLRDHUP != 0 {
 						fmt.Println("EPOLLRDHUP", event.Fd)
 						// for half we only close epollin
 						sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-							Events: uint32(sys.EPOLLIN|sys.EPOLLRDHUP),
+							Events: uint32(sys.EPOLLIN | sys.EPOLLRDHUP),
 							Fd:     int32(c.fd),
 						})
 						continue
@@ -161,8 +175,5 @@ func (r *runloop) Close() {
 	r.shutdown <- true
 	r.wg.Wait()
 	close(r.shutdown)
-	close(r.openQueue)
-	close(r.closeQueue)
 	sys.Close(r.epfd)
 }
-

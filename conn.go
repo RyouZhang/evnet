@@ -26,7 +26,7 @@ type conn struct {
 	closeQueue chan *conn
 }
 
-func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr) *conn {
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *conn) *conn {
 	return &conn{
 		fd:         fd,
 		localAddr:  localAddr,
@@ -34,6 +34,7 @@ func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr) *conn {
 		input:      make(chan []byte, 64),
 		inBuf:      bytes.NewBuffer(make([]byte, 0, 4096)),
 		errChan:    make(chan error, 4),
+		closeQueue: closeQueue,
 	}
 }
 
