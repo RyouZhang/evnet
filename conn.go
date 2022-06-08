@@ -20,21 +20,20 @@ type conn struct {
 	remoteAddr net.Addr
 	addr       sys.Sockaddr
 
-	input  chan []byte
-	inBuf  *bytes.Buffer
-	errChan chan error
-	closeQueue chan int
+	input      chan []byte
+	inBuf      *bytes.Buffer
+	errChan    chan error
+	closeQueue chan *conn
 }
 
-func newConn(fd int, closeQueue chan int, localAddr net.Addr, remoteAddr net.Addr) *conn {
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr) *conn {
 	return &conn{
-		fd:         fd,	
+		fd:         fd,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
-		closeQueue: closeQueue,
-		errChan:    make(chan error, 1),
-		input:      make(chan []byte, 64),	
+		input:      make(chan []byte, 64),
 		inBuf:      bytes.NewBuffer(make([]byte, 0, 4096)),
+		errChan:    make(chan error, 4),
 	}
 }
 
@@ -55,10 +54,11 @@ func (ec *conn) Read(b []byte) (n int, err error) {
 
 			if ec.inBuf.Len() == 0 {
 				ec.inBuf.Reset()
-			}			
+			}
 		}
-	case err =<-ec.errChan:
-		{						
+	case err = <-ec.errChan:
+		{
+			fmt.Println("read:", err)
 		}
 	}
 	return
@@ -70,9 +70,10 @@ func (ec *conn) Write(b []byte) (n int, err error) {
 }
 
 func (ec *conn) Close() error {
-	fmt.Println("conn Close",ec.fd)
-	ec.cOnce.Do(func(){
-		ec.closeQueue<-ec.fd		
+	fmt.Println("conn Close", ec.fd)
+	ec.cOnce.Do(func() {
+		ec.closeQueue <- ec
+		close(ec.input)
 	})
 	return nil
 }

@@ -1,8 +1,8 @@
 package evnet
 
 import (
-	"bytes"
-	"errors"
+	// "bytes"
+	// "errors"
 	"fmt"
 	"net"
 	"strings"
@@ -10,11 +10,6 @@ import (
 
 	sys "golang.org/x/sys/unix"
 )
-
-type msg struct {
-	fd  int
-	raw []byte
-}
 
 const ET_MODE uint32 = 1 << 31
 
@@ -25,18 +20,14 @@ type Transport struct {
 	l      *listener
 	events []sys.EpollEvent
 
+	rl        *runloop
 	connQueue chan *conn
-	closeQueue chan int
-
-	sendQueue chan *msg
 }
 
 func NewTransport() *Transport {
 	return &Transport{
 		events:    make([]sys.EpollEvent, 8),
 		connQueue: make(chan *conn, 256),
-		closeQueue: make(chan int, 64),
-		sendQueue: make(chan *msg, 1024),
 	}
 }
 
@@ -98,6 +89,14 @@ func (t *Transport) Listen(network string, addr string) (net.Listener, error) {
 
 			t.l = l
 
+			t.rl, err = newRunloop()
+			if err != nil {
+				fmt.Println(err)
+			}
+			t.rl.connQueue = t.connQueue
+
+			go t.rl.mainloop()
+
 			go t.runloop()
 			fmt.Println("server start")
 			return l, err
@@ -121,21 +120,21 @@ func (t *Transport) Listen(network string, addr string) (net.Listener, error) {
 }
 
 func (t *Transport) runloop() {
-	connDic := make(map[int]*conn)
+	// connDic := make(map[int]*conn)
 	for {
 		select {
-		case fd := <-t.closeQueue:
-			{
-				_, ok := connDic[fd]
-				if ok {
-					sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(fd), &sys.EpollEvent{
-						Events: 0,
-						Fd:     int32(fd),
-					})
-					sys.Close(fd)
-					delete(connDic, fd)
-				}
-			}
+		// case fd := <-t.closeQueue:
+		// 	{
+		// _, ok := connDic[fd]
+		// if ok {
+		// 	sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(fd), &sys.EpollEvent{
+		// 		Events: 0,
+		// 		Fd:     int32(fd),
+		// 	})
+		// 	sys.Close(fd)
+		// 	delete(connDic, fd)
+		// }
+		// }
 		case <-t.l.shutdown:
 			{
 				///shudown
@@ -143,23 +142,23 @@ func (t *Transport) runloop() {
 					Events: 0,
 					Fd:     int32(t.lfd),
 				}))
-				// fmt.Println(syscall.Shutdown(t.lfd, syscall.SHUT_RDWR))
+				fmt.Println(sys.Shutdown(t.lfd, sys.SHUT_RDWR))
 				fmt.Println(sys.Close(t.lfd))
-				fmt.Println(connDic)
-				for _, c := range connDic {
-					// sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-					// 	Events: 0,
-					// 	Fd:     int32(c.fd),
-					// })
-					// sys.Close(c.fd)
-					c.errChan <- fmt.Errorf("bad conn: %d",c.fd)
-					close(c.errChan)
-				}
-				// fmt.Println(sys.Close(t.epfd))
-				fmt.Println("closed")
-				// close(t.connQueue)
-				// close(t.closeQueue)
-				return
+
+				goto END
+
+				// fmt.Println(connDic)
+				// for _, c := range connDic {
+				// 	// sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+				// 	// 	Events: 0,
+				// 	// 	Fd:     int32(c.fd),
+				// 	// })
+				// 	// sys.Close(c.fd)
+				// 	c.errChan <- fmt.Errorf("bad conn: %d",c.fd)
+				// 	close(c.errChan)
+				// }
+				// // fmt.Println(sys.Close(t.epfd))
+				// fmt.Println("closed")
 			}
 		default:
 			{
@@ -178,8 +177,8 @@ func (t *Transport) runloop() {
 							continue
 						}
 
-						fmt.Println("acccept", fd)
-						
+						fmt.Println("acccept:", fd)
+
 						sys.SetNonblock(fd, true)
 
 						// nodelay
@@ -192,103 +191,103 @@ func (t *Transport) runloop() {
 						sys.SetsockoptInt(fd, sys.IPPROTO_TCP, sys.TCP_KEEPCNT, 1)
 
 						//read write timeout
-						sys.SetsockoptTimeval(fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec:1})
-						sys.SetsockoptTimeval(fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec:1})
+						sys.SetsockoptTimeval(fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec: 1})
+						sys.SetsockoptTimeval(fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec: 1})
 
 						addr := sa.(*sys.SockaddrInet4)
-						c := newConn(fd, t.closeQueue, t.addr, &net.TCPAddr{
+						c := newConn(fd, t.addr, &net.TCPAddr{
 							IP:   []byte{addr.Addr[0], addr.Addr[1], addr.Addr[2], addr.Addr[3]},
 							Port: addr.Port,
 						})
 
-						sys.EpollCtl(t.epfd, sys.EPOLL_CTL_ADD, c.fd, &sys.EpollEvent{
-							Events: uint32(sys.EPOLLIN  | ET_MODE | sys.EPOLLERR | sys.EPOLLRDHUP),
-							Fd:     int32(c.fd),
-						})
+						// sys.EpollCtl(t.epfd, sys.EPOLL_CTL_ADD, c.fd, &sys.EpollEvent{
+						// 	Events: uint32(sys.EPOLLIN  | ET_MODE | sys.EPOLLERR | sys.EPOLLRDHUP),
+						// 	Fd:     int32(c.fd),
+						// })
 
-						connDic[c.fd] = c
-
-						t.connQueue <- c
+						// connDic[c.fd] = c
+						t.rl.openQueue <- c
+						// t.connQueue <- c
 						continue
 					}
 
-					c, ok := connDic[int(event.Fd)]
-					if !ok {
-						sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(event.Fd), &sys.EpollEvent{
-							Events: 0,
-							Fd:     int32(event.Fd),
-						})
-						fmt.Println("invalid fd")
-						sys.Close(c.fd)
-						continue
-					}
+					// c, ok := connDic[int(event.Fd)]
+					// if !ok {
+					// 	sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(event.Fd), &sys.EpollEvent{
+					// 		Events: 0,
+					// 		Fd:     int32(event.Fd),
+					// 	})
+					// 	fmt.Println("invalid fd")
+					// 	sys.Close(c.fd)
+					// 	continue
+					// }
 
-					if event.Events&(sys.EPOLLERR) != 0 {
-						fmt.Println("EPOLLERR", event.Fd)
-						sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-							Events: 0,
-							Fd:     int32(c.fd),
-						})
+					// if event.Events&(sys.EPOLLERR) != 0 {
+					// 	fmt.Println("EPOLLERR", event.Fd)
+					// 	sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+					// 		Events: 0,
+					// 		Fd:     int32(c.fd),
+					// 	})
 
-						sys.Close(c.fd)
-						delete(connDic, c.fd)
-						c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
-						close(c.errChan)
-						continue
-					}
+					// 	sys.Close(c.fd)
+					// 	delete(connDic, c.fd)
+					// 	c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
+					// 	close(c.errChan)
+					// 	continue
+					// }
 
-					if event.Events&(sys.EPOLLRDHUP) != 0 {
-						fmt.Println("EPOLLRDHUP", event.Fd)
-						sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-							Events: 0,
-							Fd:     int32(c.fd),
-						})
-						sys.Close(c.fd)
-						delete(connDic, c.fd)
-						c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
-						close(c.errChan)
-						continue
-					}
+					// if event.Events&(sys.EPOLLRDHUP) != 0 {
+					// 	fmt.Println("EPOLLRDHUP", event.Fd)
+					// 	sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+					// 		Events: 0,
+					// 		Fd:     int32(c.fd),
+					// 	})
+					// 	sys.Close(c.fd)
+					// 	delete(connDic, c.fd)
+					// 	c.errChan <- fmt.Errorf("bad conn: %d", event.Events)
+					// 	close(c.errChan)
+					// 	continue
+					// }
 
-					if event.Events&sys.EPOLLIN != 0 {
-						// fmt.Println("EPOLLIN", event.Fd)
-						buf := bytes.NewBuffer(make([]byte, 0, 4096))
-						temp := make([]byte, 4096)
-						for {
-							n, err := sys.Read(c.fd, temp)
-							if n > 0 {
-								buf.Write(temp[:n])
-								continue
-							}
-							if n == 0 {
-								goto Next
-							}
-							if n == -1 {
-								switch {
-								case errors.Is(err, sys.EAGAIN) || errors.Is(err, sys.EINTR):
-									goto Next
-								default:
-									{
-										fmt.Println("EPOLLIN", c.fd, err)
-										sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-											Events: 0,
-											Fd:     int32(c.fd),
-										})
-										sys.Close(c.fd)
-										delete(connDic, c.fd)
-										c.errChan <- err
-										goto End
-									}
-								}
-							}
-						}
-					Next:
-						if buf.Len() > 0 {
-							c.input <- buf.Bytes()
-						}
-					End:
-						continue
-					}
+					// if event.Events&sys.EPOLLIN != 0 {
+					// 	// fmt.Println("EPOLLIN", event.Fd)
+					// 	buf := bytes.NewBuffer(make([]byte, 0, 4096))
+					// 	temp := make([]byte, 4096)
+					// 	for {
+					// 		n, err := sys.Read(c.fd, temp)
+					// 		if n > 0 {
+					// 			buf.Write(temp[:n])
+					// 			continue
+					// 		}
+					// 		if n == 0 {
+					// 			goto Next
+					// 		}
+					// 		if n == -1 {
+					// 			switch {
+					// 			case errors.Is(err, sys.EAGAIN) || errors.Is(err, sys.EINTR):
+					// 				goto Next
+					// 			default:
+					// 				{
+					// 					fmt.Println("EPOLLIN", c.fd, err)
+					// 					sys.EpollCtl(t.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+					// 						Events: 0,
+					// 						Fd:     int32(c.fd),
+					// 					})
+					// 					sys.Close(c.fd)
+					// 					delete(connDic, c.fd)
+					// 					c.errChan <- err
+					// 					goto End
+					// 				}
+					// 			}
+					// 		}
+					// 	}
+					// Next:
+					// 	if buf.Len() > 0 {
+					// 		c.input <- buf.Bytes()
+					// 	}
+					// End:
+					// 	continue
+					// }
 
 					// if event.Events&sys.EPOLLOUT != 0 {
 					// 	fmt.Println("out", c.fd)
@@ -330,4 +329,8 @@ func (t *Transport) runloop() {
 			}
 		}
 	}
+END:
+	t.rl.Close()
+	close(t.connQueue)
+	return
 }
