@@ -2,188 +2,99 @@ package evnet
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+	// "io"
+	// "errors"
 	"net"
 	"sync"
+	// "syscall"
 	"time"
 
-	"github.com/tidwall/evio"
+	sys "golang.org/x/sys/unix"
 )
 
-var bufPool = sync.Pool{}
-
 type conn struct {
-	c     evio.Conn
-	cOnce sync.Once
+	cOnce      sync.Once
+	fd         int
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	addr       sys.Sockaddr
 
-	isError bool
-
-	errChan   chan error
-	shutdown  chan bool
-	recvQueue chan []byte
-	sendQueue chan []byte
-
-	buf *bytes.Buffer
-
-	rDeadline time.Time
-	wDeadline time.Time
+	input      chan []byte
+	inBuf      *bytes.Buffer
+	errChan    chan error
+	closeQueue chan *conn
 }
 
-func newEvConn(c evio.Conn, bufferSize int) *conn {
-	buf, _ := bufPool.Get().(*bytes.Buffer)
-	if buf == nil {
-		buf = bytes.NewBuffer(make([]byte, 0, bufferSize))
-	} else {
-		buf.Reset()
-	}
-
-	evc := &conn{
-		c:         c,
-		errChan:   make(chan error, 1),
-		shutdown:  make(chan bool),
-		recvQueue: make(chan []byte, 32),
-		sendQueue: make(chan []byte, 32),
-		buf:       buf,
-	}
-	c.SetContext(evc)
-
-	return evc
-}
-
-func (ec *conn) getError() error {
-	select {
-	case err := <-ec.errChan:
-		{
-			ec.isError = true
-			if err == nil {
-				return errors.New("broken pipe")
-			}
-			return err
-		}
-	default:
-		return nil
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *conn) *conn {
+	return &conn{
+		fd:         fd,
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
+		input:      make(chan []byte, 64),
+		inBuf:      bytes.NewBuffer(make([]byte, 0, 4096)),
+		errChan:    make(chan error, 4),
+		closeQueue: closeQueue,
 	}
 }
 
 func (ec *conn) Read(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
-
-	if ec.buf.Len() > 0 {
-		n, err = ec.buf.Read(b)
-		if ec.buf.Len() == 0 {
-			ec.buf.Reset()
+	if ec.inBuf.Len() > 0 {
+		n, err = ec.inBuf.Read(b)
+		if ec.inBuf.Len() == 0 {
+			ec.inBuf.Reset()
 		}
 		return
 	}
 
-	timeout := ec.rDeadline.Sub(time.Now())
-	if timeout < 0 {
-		select {
-		case <-ec.shutdown:
-			{
-				return
-			}
-		case raw, ok := <-ec.recvQueue:
-			{
-				if ok {
-					ec.buf.Write(raw)
-					n, err = ec.buf.Read(b)
-					if err != nil {
-						return
-					}
-					if ec.buf.Len() == 0 {
-						ec.buf.Reset()
-					}
-				}
-			}
-		}
-		return
-	}
-
-	timer := time.NewTimer(timeout)
 	select {
-	case <-ec.shutdown:
+	case raw := <-ec.input:
 		{
-			timer.Stop()
-			return
-		}
-	case raw, ok := <-ec.recvQueue:
-		{
-			timer.Stop()
-			if ok {
-				ec.buf.Write(raw)
-				n, err = ec.buf.Read(b)
-				if err != nil {
-					return
-				}
-				if ec.buf.Len() == 0 {
-					ec.buf.Reset()
-				}
+			ec.inBuf.Write(raw)
+			n, err = ec.inBuf.Read(b)
+
+			if ec.inBuf.Len() == 0 {
+				ec.inBuf.Reset()
 			}
 		}
-	case <-timer.C:
+	case err = <-ec.errChan:
 		{
-			err = &net.OpError{Op: "read", Addr: ec.LocalAddr(), Source: ec.RemoteAddr(), Err: fmt.Errorf("timeout")}
+			fmt.Println("read:", err)
 		}
 	}
 	return
 }
 
 func (ec *conn) Write(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
-	select {
-	case <-ec.shutdown:
-		{
-			return
-		}
-	case ec.sendQueue <- b:
-		{
-			n = len(b)
-			ec.c.Wake()
-		}
-	}
+	n, err = sys.Write(ec.fd, b)
 	return
 }
 
 func (ec *conn) Close() error {
+	fmt.Println("conn Close", ec.fd)
 	ec.cOnce.Do(func() {
-		close(ec.shutdown)
-		if !ec.isError {
-			ec.c.Wake()
-		}
-		close(ec.sendQueue)
-		bufPool.Put(ec.buf)
+		ec.closeQueue <- ec
+		close(ec.input)
 	})
 	return nil
 }
 
 func (ec *conn) LocalAddr() net.Addr {
-	return ec.c.LocalAddr()
+	return ec.localAddr
 }
 
 func (ec *conn) RemoteAddr() net.Addr {
-	return ec.c.RemoteAddr()
+	return ec.remoteAddr
 }
 
 func (ec *conn) SetDeadline(t time.Time) error {
-	ec.rDeadline = t
-	ec.wDeadline = t
 	return nil
 }
 
 func (ec *conn) SetReadDeadline(t time.Time) error {
-	ec.rDeadline = t
 	return nil
 }
 
 func (ec *conn) SetWriteDeadline(t time.Time) error {
-	ec.wDeadline = t
 	return nil
 }
