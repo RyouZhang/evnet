@@ -2,177 +2,123 @@ package evnet
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/tidwall/evio"
+	sys "golang.org/x/sys/unix"
 )
 
-var bufPool = sync.Pool{}
-
 type conn struct {
-	c     evio.Conn
-	cOnce sync.Once
+	cOnce      sync.Once
+	fd         int
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	addr       sys.Sockaddr
 
-	isError bool
-
-	errChan   chan error
-	shutdown  chan bool
-	recvQueue chan []byte
-	sendQueue chan []byte
-
-	buf *bytes.Buffer
-
-	rDeadline time.Time
-	wDeadline time.Time
+	input      chan []byte
+	inBuf      *bytes.Buffer
+	errChan    chan error
+	closeQueue chan *msg
 }
 
-func newEvConn(c evio.Conn, bufferSize int) *conn {
-	buf, _ := bufPool.Get().(*bytes.Buffer)
-	if buf == nil {
-		buf = bytes.NewBuffer(make([]byte, 0, bufferSize))
-	} else {
-		buf.Reset()
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
+	return &conn{
+		fd:         fd,
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
+		input:      make(chan []byte, 64),
+		inBuf:      getBuffer(),
+		errChan:    make(chan error, 1),
+		closeQueue: closeQueue,
 	}
-
-	evc := &conn{
-		c:         c,
-		errChan:   make(chan error, 1),
-		shutdown:  make(chan bool),
-		recvQueue: make(chan []byte, 32),
-		sendQueue: make(chan []byte, 32),
-		buf:       buf,
-	}
-	c.SetContext(evc)
-
-	return evc
 }
 
-func (ec *conn) getError() error {
+func (c *conn) Read(b []byte) (n int, err error) {
+	if c.inBuf.Len() > 0 {
+		n, err = c.inBuf.Read(b)
+		if c.inBuf.Len() == 0 {
+			c.inBuf.Reset()
+		}
+		return
+	}
+
 	select {
-	case err := <-ec.errChan:
+	case raw := <-c.input:
 		{
-			ec.isError = true
-			if err == nil {
-				return errors.New("broken pipe")
-			}
-			return err
-		}
-	default:
-		return nil
-	}
-}
+			c.inBuf.Write(raw)
+			n, err = c.inBuf.Read(b)
 
-func (ec *conn) Read(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
-
-	if ec.buf.Len() > 0 {
-		n, err = ec.buf.Read(b)
-		if ec.buf.Len() == 0 {
-			ec.buf.Reset()
-		}
-		return
-	}
-
-	timeout := ec.rDeadline.Sub(time.Now())
-	if timeout < 0 {
-		select {
-		case raw := <-ec.recvQueue:
-			{
-				ec.buf.Write(raw)
-				n, err = ec.buf.Read(b)
-				if ec.buf.Len() == 0 {
-					ec.buf.Reset()
-				}
-			}
-		case <-ec.shutdown:
-			{
-
+			if c.inBuf.Len() == 0 {
+				c.inBuf.Reset()
 			}
 		}
-		return
-	}
-
-	timer := time.NewTimer(timeout)
-	select {
-	case <-ec.shutdown:
+	case err = <-c.errChan:
 		{
-			timer.Stop()
-		}
-	case raw := <-ec.recvQueue:
-		{
-			timer.Stop()
-			ec.buf.Write(raw)
-			n, err = ec.buf.Read(b)
-			if ec.buf.Len() == 0 {
-				ec.buf.Reset()
-			}
-		}
-	case <-timer.C:
-		{
-			err = &net.OpError{Op: "read", Addr: ec.LocalAddr(), Source: ec.RemoteAddr(), Err: fmt.Errorf("timeout")}
 		}
 	}
 	return
 }
 
-func (ec *conn) Write(b []byte) (n int, err error) {
-	err = ec.getError()
-	if err != nil {
-		return
-	}
-
-	select {
-	case <-ec.shutdown:
-		{
-		}
-	case ec.sendQueue <- b:
-		{
-			n = len(b)
-			ec.c.Wake()
-		}
-	}
+func (c *conn) Write(b []byte) (n int, err error) {
+	n, err = sys.Write(c.fd, b)
 	return
 }
 
-func (ec *conn) Close() error {
-	ec.cOnce.Do(func() {
-		close(ec.shutdown)
-		if !ec.isError {
-			ec.c.Wake()
-		}
-		close(ec.sendQueue)
-		bufPool.Put(ec.buf)
+func (c *conn) Close() error {
+	c.cOnce.Do(func() {
+		c.closeQueue <- &msg{action: actionCloseConn, c: c}
+		close(c.input)
+		close(c.errChan)
+		c.errChan = nil
+		putBuffer(c.inBuf)
 	})
 	return nil
 }
 
-func (ec *conn) LocalAddr() net.Addr {
-	return ec.c.LocalAddr()
+func (c *conn) LocalAddr() net.Addr {
+	return c.localAddr
 }
 
-func (ec *conn) RemoteAddr() net.Addr {
-	return ec.c.RemoteAddr()
+func (c *conn) RemoteAddr() net.Addr {
+	return c.remoteAddr
 }
 
-func (ec *conn) SetDeadline(t time.Time) error {
-	ec.rDeadline = t
-	ec.wDeadline = t
+func (c *conn) SetDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		//read write timeout
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &ts)
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &ts)
+	}
 	return nil
 }
 
-func (ec *conn) SetReadDeadline(t time.Time) error {
-	ec.rDeadline = t
+func (c *conn) SetReadDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+	//read timeout
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &ts)
+	}
 	return nil
 }
 
-func (ec *conn) SetWriteDeadline(t time.Time) error {
-	ec.wDeadline = t
+func (c *conn) SetWriteDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+	//write timeout
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &ts)
+	}
 	return nil
 }
