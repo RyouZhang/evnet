@@ -9,7 +9,7 @@ import (
 const ET_MODE uint32 = 1 << 31
 
 type Transport struct {
-	opts Options
+	opts       Options
 	runloopNum int
 }
 
