@@ -2,12 +2,8 @@ package evnet
 
 import (
 	"bytes"
-	"fmt"
-	// "io"
-	// "errors"
 	"net"
 	"sync"
-	// "syscall"
 	"time"
 
 	sys "golang.org/x/sys/unix"
@@ -23,78 +19,106 @@ type conn struct {
 	input      chan []byte
 	inBuf      *bytes.Buffer
 	errChan    chan error
-	closeQueue chan *conn
+	closeQueue chan *msg
 }
 
-func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *conn) *conn {
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
 	return &conn{
 		fd:         fd,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 		input:      make(chan []byte, 64),
-		inBuf:      bytes.NewBuffer(make([]byte, 0, 4096)),
-		errChan:    make(chan error, 4),
+		inBuf:      getBuffer(),
+		errChan:    make(chan error, 1),
 		closeQueue: closeQueue,
 	}
 }
 
-func (ec *conn) Read(b []byte) (n int, err error) {
-	if ec.inBuf.Len() > 0 {
-		n, err = ec.inBuf.Read(b)
-		if ec.inBuf.Len() == 0 {
-			ec.inBuf.Reset()
+func (c *conn) Read(b []byte) (n int, err error) {
+	if c.inBuf.Len() > 0 {
+		n, err = c.inBuf.Read(b)
+		if c.inBuf.Len() == 0 {
+			c.inBuf.Reset()
 		}
 		return
 	}
 
 	select {
-	case raw := <-ec.input:
+	case raw := <-c.input:
 		{
-			ec.inBuf.Write(raw)
-			n, err = ec.inBuf.Read(b)
+			c.inBuf.Write(raw)
+			n, err = c.inBuf.Read(b)
 
-			if ec.inBuf.Len() == 0 {
-				ec.inBuf.Reset()
+			if c.inBuf.Len() == 0 {
+				c.inBuf.Reset()
 			}
 		}
-	case err = <-ec.errChan:
+	case err = <-c.errChan:
 		{
-			fmt.Println("read:", err)
 		}
 	}
 	return
 }
 
-func (ec *conn) Write(b []byte) (n int, err error) {
-	n, err = sys.Write(ec.fd, b)
+func (c *conn) Write(b []byte) (n int, err error) {
+	n, err = sys.Write(c.fd, b)
 	return
 }
 
-func (ec *conn) Close() error {
-	fmt.Println("conn Close", ec.fd)
-	ec.cOnce.Do(func() {
-		ec.closeQueue <- ec
-		close(ec.input)
+func (c *conn) Close() error {
+	c.cOnce.Do(func() {
+		c.closeQueue <- &msg{action: actionCloseConn, c: c}
+		close(c.input)
+		close(c.errChan)
+		c.errChan = nil
+		putBuffer(c.inBuf)
 	})
 	return nil
 }
 
-func (ec *conn) LocalAddr() net.Addr {
-	return ec.localAddr
+func (c *conn) LocalAddr() net.Addr {
+	return c.localAddr
 }
 
-func (ec *conn) RemoteAddr() net.Addr {
-	return ec.remoteAddr
+func (c *conn) RemoteAddr() net.Addr {
+	return c.remoteAddr
 }
 
-func (ec *conn) SetDeadline(t time.Time) error {
+func (c *conn) SetDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		//read write timeout
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &ts)
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &ts)
+	}
 	return nil
 }
 
-func (ec *conn) SetReadDeadline(t time.Time) error {
+func (c *conn) SetReadDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+	//read timeout
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_RCVTIMEO, &ts)
+	}
 	return nil
 }
 
-func (ec *conn) SetWriteDeadline(t time.Time) error {
+func (c *conn) SetWriteDeadline(t time.Time) error {
+	duration := t.Nanosecond() - time.Now().Nanosecond()
+	//write timeout
+	if duration < 0 {
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &sys.Timeval{Sec: 0, Usec: 0})
+	} else {
+		ts := sys.NsecToTimeval(int64(duration))
+		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &ts)
+	}
 	return nil
 }

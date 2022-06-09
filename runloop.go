@@ -1,7 +1,6 @@
 package evnet
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,82 +8,93 @@ import (
 	sys "golang.org/x/sys/unix"
 )
 
-type runloop struct {
-	epfd   int
-	events []sys.EpollEvent
+const actionOpenConn = 1
+const actionCloseConn = 2
+const actionShutdown = 3
 
-	wg         sync.WaitGroup
-	openQueue  chan *conn
-	closeQueue chan *conn
-	shutdown   chan bool
+type msg struct {
+	action int // 1 add 2 del 3 shutdown
+	c      *conn
 }
 
-func newRunloop(openQueue chan *conn, closeQueue chan *conn) (*runloop, error) {
+type runloop struct {
+	epfd int
+
+	wg       sync.WaitGroup
+	msgQueue chan *msg
+}
+
+func newRunloop() (*runloop, error) {
 	epfd, err := sys.EpollCreate1(sys.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
 	return &runloop{
-		epfd:       epfd,
-		events:     make([]sys.EpollEvent, 8),
-		shutdown:   make(chan bool, 1),
-		openQueue:  openQueue,
-		closeQueue: closeQueue,
+		epfd:     epfd,
+		msgQueue: make(chan *msg, 256),
 	}, nil
 }
 
 func (r *runloop) mainloop() {
+	events := make([]sys.EpollEvent, 8)
 	connDic := make(map[int]*conn)
+	temp := make([]byte, 8192)
+	isShutdown := false
 	for {
 		select {
-		case <-r.shutdown:
+		case m, ok := <-r.msgQueue:
 			{
-				fmt.Println(connDic)
-				for _, c := range connDic {
-					c.errChan <- fmt.Errorf("close fd: %d", c.fd)
+				if ok {
+					switch m.action {
+					case actionOpenConn:
+						{
+							r.wg.Add(1)
+							c := m.c
+							connDic[c.fd] = c
+
+							sys.EpollCtl(r.epfd, sys.EPOLL_CTL_ADD, c.fd, &sys.EpollEvent{
+								Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
+								Fd:     int32(c.fd),
+							})
+						}
+					case actionCloseConn:
+						{
+							c := m.c
+							_, ok := connDic[c.fd]
+							if ok {
+								delete(connDic, c.fd)
+								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
+									Events: 0,
+									Fd:     int32(c.fd),
+								})
+								sys.Close(c.fd)
+								r.wg.Done()
+							}
+						}
+					case actionShutdown:
+						{
+							isShutdown = true
+							for _, c := range connDic {
+								c.errChan <- fmt.Errorf("broke fd: %d", c.fd)
+							}
+						}
+					}
 				}
-				if len(connDic) == 0 {
+
+				if isShutdown && len(connDic) == 0 {
+					sys.Close(r.epfd)
 					return
 				}
 			}
-		case c := <-r.closeQueue:
-			{
-				fmt.Println("closeing:", c)
-				_, ok := connDic[c.fd]
-				if ok {
-					delete(connDic, c.fd)
-
-					sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
-						Events: 0,
-						Fd:     int32(c.fd),
-					})
-					sys.Close(c.fd)
-
-					r.wg.Done()
-					fmt.Println(connDic)
-				}
-			}
-		case c := <-r.openQueue:
-			{
-				r.wg.Add(1)
-				connDic[c.fd] = c
-				fmt.Println("open:", c)
-				c.closeQueue = r.closeQueue
-
-				sys.EpollCtl(r.epfd, sys.EPOLL_CTL_ADD, c.fd, &sys.EpollEvent{
-					Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
-					Fd:     int32(c.fd),
-				})
-			}
 		default:
 			{
-				count, err := sys.EpollWait(r.epfd, r.events, 1000)
+				count, err := sys.EpollWait(r.epfd, events, 1000)
 				if err != nil {
 					fmt.Println(err)
 					continue
 				}
 				for i := 0; i < count; i++ {
-					event := r.events[i]
+					event := events[i]
 
 					c, ok := connDic[int(event.Fd)]
 					if !ok {
@@ -93,40 +103,32 @@ func (r *runloop) mainloop() {
 							Fd:     int32(c.fd),
 						})
 						sys.Close(c.fd)
-						fmt.Println("invalid fd")
 						continue
 					}
-					// fmt.Println(c.fd, event.Events&sys.EPOLLIN, event.Events&sys.EPOLLRDHUP, event.Events & sys.EPOLLOUT)
 
 					if event.Events&sys.EPOLLHUP != 0 {
-						fmt.Println("EPOLLHUP", event.Fd)
 						delete(connDic, c.fd)
-
 						sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
 							Events: 0,
 							Fd:     int32(c.fd),
 						})
 						sys.Close(c.fd)
-
 						r.wg.Done()
+
 						c.errChan <- fmt.Errorf("broke fd: %d", c.fd)
 						continue
 					}
 
 					if event.Events&sys.EPOLLRDHUP != 0 {
-						fmt.Println("EPOLLRDHUP", event.Fd)
 						// for half we only close epollin
 						sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
 							Events: uint32(sys.EPOLLIN | sys.EPOLLRDHUP),
 							Fd:     int32(c.fd),
 						})
-						continue
 					}
 
 					if event.Events&sys.EPOLLIN != 0 {
-						// fmt.Println("EPOLLIN", event.Fd)
-						buf := bytes.NewBuffer(make([]byte, 0, 4096))
-						temp := make([]byte, 4096)
+						buf := getBuffer()
 						for {
 							n, err := sys.Read(c.fd, temp)
 							if n > 0 {
@@ -142,16 +144,14 @@ func (r *runloop) mainloop() {
 									goto Next
 								default:
 									{
-										fmt.Println("EPOLLIN", c.fd, err)
 										delete(connDic, c.fd)
-
 										sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
 											Events: 0,
 											Fd:     int32(c.fd),
 										})
 										sys.Close(c.fd)
-
 										r.wg.Done()
+
 										c.errChan <- err
 										goto End
 									}
@@ -163,7 +163,7 @@ func (r *runloop) mainloop() {
 							c.input <- buf.Bytes()
 						}
 					End:
-						continue
+						// do nothing
 					}
 				}
 			}
@@ -172,8 +172,7 @@ func (r *runloop) mainloop() {
 }
 
 func (r *runloop) Close() {
-	r.shutdown <- true
+	r.msgQueue <- &msg{action: actionShutdown}
 	r.wg.Wait()
-	close(r.shutdown)
-	sys.Close(r.epfd)
+	close(r.msgQueue)
 }
