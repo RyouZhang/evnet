@@ -28,7 +28,7 @@ func (h *MyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func main() {
 	ctx := context.Background()
 
-	ln, err := evnet.NewTransport(evnet.DefaultOptions).Listen("tcp://:7689")
+	ln, err := evnet.NewTransport(evnet.DefaultOptions()).Listen("tcp", "0.0.0.0:7689")
 	if err != nil {
 		fmt.Println(err)
 		return
