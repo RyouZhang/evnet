@@ -27,7 +27,7 @@ func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *m
 		fd:         fd,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
-		input:      make(chan []byte, 64),
+		input:      make(chan []byte, 126),
 		inBuf:      getBuffer(),
 		errChan:    make(chan error, 1),
 		closeQueue: closeQueue,
