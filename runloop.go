@@ -89,8 +89,7 @@ func (r *runloop) mainloop() {
 		default:
 			{
 				count, err := sys.EpollWait(r.epfd, events, 1000)
-				if err != nil {
-					fmt.Println(err)
+				if err != nil {	
 					continue
 				}
 				for i := 0; i < count; i++ {
