@@ -7,7 +7,7 @@ import (
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 8192))
+		return bytes.NewBuffer(make([]byte, 0, 4096))
 	},
 }
 

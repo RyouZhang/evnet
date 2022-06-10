@@ -31,14 +31,14 @@ func newRunloop() (*runloop, error) {
 	}
 	return &runloop{
 		epfd:     epfd,
-		msgQueue: make(chan *msg, 256),
+		msgQueue: make(chan *msg, 512),
 	}, nil
 }
 
 func (r *runloop) mainloop() {
 	events := make([]sys.EpollEvent, 8)
 	connDic := make(map[int]*conn)
-	temp := make([]byte, 8192)
+	temp := make([]byte, 4096)
 	isShutdown := false
 	for {
 		select {
@@ -89,8 +89,7 @@ func (r *runloop) mainloop() {
 		default:
 			{
 				count, err := sys.EpollWait(r.epfd, events, 1000)
-				if err != nil {
-					fmt.Println(err)
+				if err != nil {	
 					continue
 				}
 				for i := 0; i < count; i++ {
