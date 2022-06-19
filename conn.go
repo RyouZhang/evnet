@@ -5,35 +5,34 @@ import (
 	"net"
 	"sync"
 	"time"
+	// "fmt"
 
 	sys "golang.org/x/sys/unix"
 )
 
 type conn struct {
 	cOnce      sync.Once
-	epfd int
 	fd         int
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	addr       sys.Sockaddr
 
-	input      chan []byte
-	inBuf      *bytes.Buffer
+	input  chan []byte
+	inBuf  *bytes.Buffer
+	outBuf *bytes.Buffer
 
-	outBuf     *bytes.Buffer
 	errChan    chan error
 	closeQueue chan *msg
 }
 
-func newConn(epfd int, fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
+func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
 	return &conn{
-		epfd: epfd,
 		fd:         fd,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
-		input:      make(chan []byte, 126),
+		input:      make(chan []byte, 1024),
 		inBuf:      getBuffer(),
-		outBuf:		getBuffer(),
+		outBuf:     getBuffer(),
 		errChan:    make(chan error, 1),
 		closeQueue: closeQueue,
 	}
@@ -65,26 +64,30 @@ func (c *conn) Read(b []byte) (n int, err error) {
 	return
 }
 
-func (c *conn) Write(b []byte) (n int, err error) {	
-	needTrigger := c.outBuf.Len() == 0
-	n, err = c.outBuf.Write(b)
-	if needTrigger {
-		sys.EpollCtl(c.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
-			Events: uint32(sys.EPOLLIN | sys.EPOLLOUT | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
-			Fd:     int32(c.fd),
-		})
-	}
+func (c *conn) Write(b []byte) (n int, err error) {
+	n, err = sys.Write(c.fd, b)
+	// if c.outBuf.Len() > 0 {
+	// 	return c.outBuf.Write(b)
+	// }
+
 	// n, err = sys.Write(c.fd, b)
+	// if err == sys.EAGAIN {
+	// 	if n < len(b) {
+	// 		c.outBuf.Write(b[n:])
+	// 	}
+	// 	err = nil
+	// }
 	return
 }
 
 func (c *conn) Close() error {
 	c.cOnce.Do(func() {
 		c.closeQueue <- &msg{action: actionCloseConn, c: c}
-		close(c.input)
+		// close(c.input)
 		close(c.errChan)
 		c.errChan = nil
 		putBuffer(c.inBuf)
+		putBuffer(c.outBuf)
 	})
 	return nil
 }
@@ -136,6 +139,6 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *conn)CloseWrite() error {
-	return sys.Shutdown(c.fd, sys.SHUT_WR)	
+func (c *conn) CloseWrite() error {
+	return sys.Shutdown(c.fd, sys.SHUT_WR)
 }

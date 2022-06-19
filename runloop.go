@@ -13,7 +13,7 @@ const actionCloseConn = 2
 const actionShutdown = 3
 
 type msg struct {
-	action int // 1 add 2 del 3 shutdown
+	action int // 1 add 2 del 3 shutdown 4 write
 	c      *conn
 }
 
@@ -38,7 +38,7 @@ func newRunloop() (*runloop, error) {
 func (r *runloop) mainloop() {
 	events := make([]sys.EpollEvent, 8)
 	connDic := make(map[int]*conn)
-	temp := make([]byte, 4096)
+	temp := make([]byte, 8192)
 	isShutdown := false
 	for {
 		select {
@@ -63,6 +63,7 @@ func (r *runloop) mainloop() {
 							_, ok := connDic[c.fd]
 							if ok {
 								delete(connDic, c.fd)
+								close(c.input)
 								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
 									Events: 0,
 									Fd:     int32(c.fd),
@@ -89,12 +90,12 @@ func (r *runloop) mainloop() {
 		default:
 			{
 				count, err := sys.EpollWait(r.epfd, events, 1000)
-				if err != nil {	
+				if err != nil {
 					continue
 				}
+
 				for i := 0; i < count; i++ {
 					event := events[i]
-
 					c, ok := connDic[int(event.Fd)]
 					if !ok {
 						sys.EpollCtl(r.epfd, sys.EPOLL_CTL_DEL, int(c.fd), &sys.EpollEvent{
@@ -126,9 +127,9 @@ func (r *runloop) mainloop() {
 						})
 					}
 
-					if event.Events&sys.EPOLLIN != 0 {
+					if event.Events&sys.EPOLLIN == sys.EPOLLIN {
 						buf := getBuffer()
-						for {			
+						for {
 							n, err := sys.Read(c.fd, temp)
 							if n > 0 {
 								buf.Write(temp[:n])
@@ -156,6 +157,10 @@ func (r *runloop) mainloop() {
 									}
 								}
 							}
+							if err != nil {
+								c.errChan <- fmt.Errorf("broke fd: %d", c.fd)
+								goto End
+							}
 						}
 					Next:
 						if buf.Len() > 0 {
@@ -163,27 +168,22 @@ func (r *runloop) mainloop() {
 						}
 					End:
 						// do nothing
+						putBuffer(buf)
 					}
-
-					if event.Events&sys.EPOLLOUT != 0 {					
-						if c.outBuf.Len() > 0 {						
-							n, _ := c.outBuf.Read(temp)
-							sys.Write(c.fd, temp[:n])
-							if c.outBuf.Len() == 0 {
-								c.outBuf.Reset()
-
-								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
-									Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
-									Fd:     int32(c.fd),
-								})
-							} else {
-								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
-									Events: uint32(sys.EPOLLIN | sys.EPOLLOUT | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
-									Fd:     int32(c.fd),
-								})
-							}
-						}
-					}
+					// if event.Events&sys.EPOLLOUT == sys.EPOLLOUT {
+					// 	if c.outBuf.Len() > 0 {
+					// 		fmt.Println("EPOLLOUT", c.fd, c.outBuf.Len())
+					// 		n, _ := c.outBuf.Read(temp)
+					// 		_, err := sys.Write(c.fd, temp[:n])
+					// 		if err != nil {
+					// 			c.errChan <- fmt.Errorf("broke fd: %d", c.fd)
+					// 			continue
+					// 		}
+					// 		if c.outBuf.Len() == 0 {
+					// 			c.outBuf.Reset()
+					// 		}
+					// 	}
+					// }
 				}
 			}
 		}

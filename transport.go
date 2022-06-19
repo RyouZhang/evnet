@@ -143,7 +143,6 @@ func (t *Transport) listen(lfd int, epfd int) {
 			{
 				count, err := sys.EpollWait(epfd, events, 1000)
 				if err != nil {
-					fmt.Println(err)
 					continue
 				}
 				for i := 0; i < count; i++ {
@@ -178,7 +177,7 @@ func (t *Transport) listen(lfd int, epfd int) {
 						rl := t.fetchRunloop()
 
 						addr := sa.(*sys.SockaddrInet4)
-						c := newConn(rl.epfd, fd, t.addr, &net.TCPAddr{
+						c := newConn(fd, t.addr, &net.TCPAddr{
 							IP:   []byte{addr.Addr[0], addr.Addr[1], addr.Addr[2], addr.Addr[3]},
 							Port: addr.Port,
 						}, rl.msgQueue)
