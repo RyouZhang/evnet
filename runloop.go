@@ -128,7 +128,7 @@ func (r *runloop) mainloop() {
 
 					if event.Events&sys.EPOLLIN != 0 {
 						buf := getBuffer()
-						for {
+						for {			
 							n, err := sys.Read(c.fd, temp)
 							if n > 0 {
 								buf.Write(temp[:n])
@@ -163,6 +163,26 @@ func (r *runloop) mainloop() {
 						}
 					End:
 						// do nothing
+					}
+
+					if event.Events&sys.EPOLLOUT != 0 {					
+						if c.outBuf.Len() > 0 {						
+							n, _ := c.outBuf.Read(temp)
+							sys.Write(c.fd, temp[:n])
+							if c.outBuf.Len() == 0 {
+								c.outBuf.Reset()
+
+								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
+									Events: uint32(sys.EPOLLIN | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
+									Fd:     int32(c.fd),
+								})
+							} else {
+								sys.EpollCtl(r.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
+									Events: uint32(sys.EPOLLIN | sys.EPOLLOUT | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
+									Fd:     int32(c.fd),
+								})
+							}
+						}
 					}
 				}
 			}

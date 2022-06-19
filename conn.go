@@ -11,6 +11,7 @@ import (
 
 type conn struct {
 	cOnce      sync.Once
+	epfd int
 	fd         int
 	localAddr  net.Addr
 	remoteAddr net.Addr
@@ -18,17 +19,21 @@ type conn struct {
 
 	input      chan []byte
 	inBuf      *bytes.Buffer
+
+	outBuf     *bytes.Buffer
 	errChan    chan error
 	closeQueue chan *msg
 }
 
-func newConn(fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
+func newConn(epfd int, fd int, localAddr net.Addr, remoteAddr net.Addr, closeQueue chan *msg) *conn {
 	return &conn{
+		epfd: epfd,
 		fd:         fd,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 		input:      make(chan []byte, 126),
 		inBuf:      getBuffer(),
+		outBuf:		getBuffer(),
 		errChan:    make(chan error, 1),
 		closeQueue: closeQueue,
 	}
@@ -60,8 +65,16 @@ func (c *conn) Read(b []byte) (n int, err error) {
 	return
 }
 
-func (c *conn) Write(b []byte) (n int, err error) {
-	n, err = sys.Write(c.fd, b)
+func (c *conn) Write(b []byte) (n int, err error) {	
+	needTrigger := c.outBuf.Len() == 0
+	n, err = c.outBuf.Write(b)
+	if needTrigger {
+		sys.EpollCtl(c.epfd, sys.EPOLL_CTL_MOD, c.fd, &sys.EpollEvent{
+			Events: uint32(sys.EPOLLIN | sys.EPOLLOUT | ET_MODE | sys.EPOLLRDHUP | sys.EPOLLHUP),
+			Fd:     int32(c.fd),
+		})
+	}
+	// n, err = sys.Write(c.fd, b)
 	return
 }
 
@@ -121,4 +134,8 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 		sys.SetsockoptTimeval(c.fd, sys.SOL_SOCKET, sys.SO_SNDTIMEO, &ts)
 	}
 	return nil
+}
+
+func (c *conn)CloseWrite() error {
+	return sys.Shutdown(c.fd, sys.SHUT_WR)	
 }
